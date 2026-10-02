@@ -88,6 +88,14 @@ defaultConfiguration {
 }
 ```
 
+### NFSv4 reply-buffer allocation
+
+`mount.nfsv4.maximumReplyBodyPreallocationBytes` caps initial RPC reply-body
+allocation at 4096 bytes by default. Zero disables preallocation; larger
+replies still grow their buffers. Increase the cap for workloads dominated
+by large reads, at the cost of more allocation for small metadata replies.
+This option applies only to NFSv4.
+
 ## Using bb\_clientd...
 
 ### ... as a proxy for gRPC requests

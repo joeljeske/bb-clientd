@@ -207,6 +207,7 @@ local cacheDirectory = std.extVar('XDG_CACHE_HOME') + '/bb_clientd';
     nfsv4: {
       enforcedLeaseTime: '120s',
       announcedLeaseTime: '60s',
+      maximumReplyBodyPreallocationBytes: 4096,
     } + {
       // OS specific configuration options for NFSv4.
       Darwin: { darwin: { socketPath: cacheDirectory + '/nfsv4' } },

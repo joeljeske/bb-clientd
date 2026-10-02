@@ -1,0 +1,168 @@
+diff --git pkg/rpcserver/server.go pkg/rpcserver/server.go
+index 4a7b3ab..7dc41f2 100644
+--- pkg/rpcserver/server.go
++++ pkg/rpcserver/server.go
+@@ -52,16 +52,20 @@ type Service func(ctx context.Context, vers, proc uint32, parameters io.ReadClos
+ 
+ // Server of ONC RPCv2, as described in RFC 5531.
+ type Server struct {
+-	services      map[uint32]Service
+-	authenticator Authenticator
++	services                           map[uint32]Service
++	authenticator                      Authenticator
++	maximumReplyBodyPreallocationBytes uint32
+ }
+ 
+ // NewServer creates a new Server that is capable of accepting incoming
+ // requests for a provided set of services.
+-func NewServer(services map[uint32]Service, authenticator Authenticator) *Server {
++// The preallocation limit excludes the RPC header. Larger replies grow
++// the buffer as needed. A limit of zero disables body preallocation.
++func NewServer(services map[uint32]Service, authenticator Authenticator, maximumReplyBodyPreallocationBytes uint32) *Server {
+ 	return &Server{
+-		services:      services,
+-		authenticator: authenticator,
++		services:                           services,
++		authenticator:                      authenticator,
++		maximumReplyBodyPreallocationBytes: maximumReplyBodyPreallocationBytes,
+ 	}
+ }
+ 
+@@ -209,15 +213,15 @@ func (ch *connectionHandler) readMessages() error {
+ 			connectionHandler:   ch,
+ 		}
+ 
+-		// Allocate buffer space for storing the reply, based on
+-		// the largest reply sent so far.
++		// Bound preallocation so that large replies don't cause
++		// excessive allocations for subsequent small replies.
+ 		maximumReplyRPCMessageSizeBytes := ch.maximumReplyRPCMessageSizeBytes.get()
+ 		maximumReplyReturnValueSizeBytes := ch.maximumReplyReturnValueSizeBytes.get()
+ 		replyReturnValueStartBytes := recordMarkerSizeBytes + maximumReplyRPCMessageSizeBytes
+ 		replyBuffer := bytes.NewBuffer(make(
+ 			[]byte,
+ 			replyReturnValueStartBytes,
+-			replyReturnValueStartBytes+maximumReplyReturnValueSizeBytes))
++			replyReturnValueStartBytes+min(maximumReplyReturnValueSizeBytes, server.maximumReplyBodyPreallocationBytes)))
+ 
+ 		replyData, err := service(ctxWithAuth, callBody.Vers, callBody.Proc, &rc, replyBuffer)
+ 		cancelContext()
+@@ -226,9 +230,7 @@ func (ch *connectionHandler) readMessages() error {
+ 			return err
+ 		}
+ 
+-		// If the return value is bigger than observed before,
+-		// store its size, so that future requests can
+-		// immediately allocate a properly sized buffer.
++		// Track the largest return value for subsequent preallocation.
+ 		replyReturnValueSizeBytes := uint32(replyBuffer.Len()) - replyReturnValueStartBytes
+ 		ch.maximumReplyReturnValueSizeBytes.maybeIncrease(
+ 			maximumReplyReturnValueSizeBytes,
+diff --git pkg/rpcserver/server_test.go pkg/rpcserver/server_test.go
+index 71ec9c0..4a341b4 100644
+--- pkg/rpcserver/server_test.go
++++ pkg/rpcserver/server_test.go
+@@ -3,6 +3,7 @@ package rpcserver_test
+ import (
+ 	"bytes"
+ 	"context"
++	"encoding/binary"
+ 	"errors"
+ 	"io"
+ 	"testing"
+@@ -21,7 +22,7 @@ func TestServer(t *testing.T) {
+ 	authenticator := mock.NewMockAuthenticator(ctrl)
+ 	s := rpcserver.NewServer(map[uint32]rpcserver.Service{
+ 		123: service.Call,
+-	}, authenticator)
++	}, authenticator, 4096)
+ 
+ 	t.Run("EOF", func(t *testing.T) {
+ 		// It's valid for a client to close the connection
+@@ -417,4 +418,86 @@ func TestServer(t *testing.T) {
+ 				0xa9, 0x73, 0x1c, 0xfa, 0xfe, 0x16, 0xe0, 0x81,
+ 			}), w))
+ 	})
++
++	t.Run("ReplyBodyPreallocation", func(t *testing.T) {
++		for _, maximum := range []uint32{0, 1, 1024, 4096, 64 * 1024} {
++			s := rpcserver.NewServer(map[uint32]rpcserver.Service{
++				123: service.Call,
++			}, authenticator, maximum)
++
++			// Each connection starts with an empty reply-size history.
++			for connection := 0; connection < 2; connection++ {
++				r := mock.NewMockReader(ctrl)
++				w := mock.NewMockWriter(ctrl)
++				requestReady := make(chan struct{})
++				close(requestReady)
++				var maximumObserved uint32
++				var expectedCapacities, actualCapacities []int
++				sizes := []uint32{32, 64, 1 << 20, 32, 4095, 4096, 4097, 64 << 10, 1 << 20, 32}
++				authenticator.EXPECT().Authenticate(gomock.Any(), &rpcv2.OpaqueAuth{}, &rpcv2.OpaqueAuth{}).
++					DoAndReturn(func(ctx context.Context, credentials, verifier *rpcv2.OpaqueAuth) (context.Context, rpcv2.OpaqueAuth, rpcv2.AuthStat) {
++						return ctx, rpcv2.OpaqueAuth{}, rpcv2.AUTH_OK
++					}).Times(len(sizes))
++
++				for i, size := range sizes {
++					request := []byte{
++						0x80, 0x00, 0x00, 0x28, // Record marker.
++						0x00, 0x00, 0x00, 0x00, // XID, set below.
++						0x00, 0x00, 0x00, 0x00, // CALL.
++						0x00, 0x00, 0x00, 0x02, // RPC version.
++						0x00, 0x00, 0x00, 0x7b, // Program.
++						0x00, 0x00, 0x00, 0x01, // Program version.
++						0x00, 0x00, 0x00, 0x01, // Procedure.
++						0x00, 0x00, 0x00, 0x00, // AUTH_NONE credentials.
++						0x00, 0x00, 0x00, 0x00,
++						0x00, 0x00, 0x00, 0x00, // AUTH_NONE verifier.
++						0x00, 0x00, 0x00, 0x00,
++					}
++					binary.BigEndian.PutUint32(request[4:], uint32(i+1))
++					ready := requestReady
++					r.EXPECT().Read(gomock.Any()).DoAndReturn(func(p []byte) (int, error) {
++						// Wait until the previous reply's size has been recorded.
++						<-ready
++						return copy(p, request), nil
++					})
++
++					expectedCapacities = append(expectedCapacities, int(min(maximumObserved, maximum)))
++					data := bytes.Repeat([]byte{0xa5}, int(size))
++					service.EXPECT().Call(gomock.Any(), uint32(1), uint32(1), gomock.Any(), gomock.Any()).
++						DoAndReturn(func(ctx context.Context, vers, proc uint32, parameters io.ReadCloser, returnValue io.Writer) (rpcv2.AcceptedReplyData, error) {
++							actualCapacities = append(actualCapacities, returnValue.(*bytes.Buffer).Available())
++							n, err := returnValue.Write(data)
++							require.Equal(t, len(data), n)
++							require.NoError(t, err)
++							return &rpcv2.AcceptedReplyData_SUCCESS{}, nil
++						})
++
++					reply := []byte{
++						0x00, 0x00, 0x00, 0x00, // Record marker, set below.
++						0x00, 0x00, 0x00, 0x00, // XID, set below.
++						0x00, 0x00, 0x00, 0x01, // REPLY.
++						0x00, 0x00, 0x00, 0x00, // MSG_ACCEPTED.
++						0x00, 0x00, 0x00, 0x00, // AUTH_NONE verifier.
++						0x00, 0x00, 0x00, 0x00,
++						0x00, 0x00, 0x00, 0x00, // SUCCESS.
++					}
++					binary.BigEndian.PutUint32(reply, uint32(24+len(data))|0x80000000)
++					binary.BigEndian.PutUint32(reply[4:], uint32(i+1))
++					reply = append(reply, data...)
++					nextRequestReady := make(chan struct{})
++					w.EXPECT().Write(gomock.Any()).DoAndReturn(func(p []byte) (int, error) {
++						defer close(nextRequestReady)
++						require.Equal(t, reply, p)
++						return len(p), nil
++					})
++					requestReady = nextRequestReady
++					maximumObserved = max(maximumObserved, size)
++				}
++				r.EXPECT().Read(gomock.Any()).Return(0, io.EOF)
++
++				require.NoError(t, s.HandleConnection(r, w))
++				require.Equal(t, expectedCapacities, actualCapacities)
++			}
++		}
++	})
+ }

@@ -1,0 +1,118 @@
+diff --git pkg/filesystem/virtual/configuration/configuration.go pkg/filesystem/virtual/configuration/configuration.go
+index 740aa4a..8b5e655 100644
+--- pkg/filesystem/virtual/configuration/configuration.go
++++ pkg/filesystem/virtual/configuration/configuration.go
+@@ -132,11 +132,15 @@ func (m *nfsv4Mount) Expose(terminationGroup program.Group, rootDirectory virtua
+ 	})
+ 
+ 	// Create an RPC server that offers the NFSv4 program.
++	maximumReplyBodyPreallocationBytes := uint32(4096)
++	if maximum := m.configuration.MaximumReplyBodyPreallocationBytes; maximum != nil {
++		maximumReplyBodyPreallocationBytes = maximum.Value
++	}
+ 	rpcServer := rpcserver.NewServer(map[uint32]rpcserver.Service{
+ 		nfsv4_xdr.NFS4_PROGRAM_PROGRAM_NUMBER: nfsv4_xdr.NewNfs4ProgramService(
+ 			nfsv4.NewMetricsProgram(program),
+ 		),
+-	}, authenticator)
++	}, authenticator, maximumReplyBodyPreallocationBytes)
+ 
+ 	return m.mount(terminationGroup, rpcServer)
+ }
+diff --git pkg/proto/configuration/filesystem/virtual/virtual.pb.go pkg/proto/configuration/filesystem/virtual/virtual.pb.go
+index 446336f..dd549e9 100644
+--- pkg/proto/configuration/filesystem/virtual/virtual.pb.go
++++ pkg/proto/configuration/filesystem/virtual/virtual.pb.go
+@@ -279,12 +279,13 @@ type NFSv4MountConfiguration struct {
+ 	//
+ 	//	*NFSv4MountConfiguration_Darwin
+ 	//	*NFSv4MountConfiguration_Linux
+-	OperatingSystem      isNFSv4MountConfiguration_OperatingSystem `protobuf_oneof:"operating_system"`
+-	EnforcedLeaseTime    *durationpb.Duration                      `protobuf:"bytes,2,opt,name=enforced_lease_time,json=enforcedLeaseTime,proto3" json:"enforced_lease_time,omitempty"`
+-	AnnouncedLeaseTime   *durationpb.Duration                      `protobuf:"bytes,3,opt,name=announced_lease_time,json=announcedLeaseTime,proto3" json:"announced_lease_time,omitempty"`
+-	SystemAuthentication *RPCv2SystemAuthenticationConfiguration   `protobuf:"bytes,4,opt,name=system_authentication,json=systemAuthentication,proto3" json:"system_authentication,omitempty"`
+-	unknownFields        protoimpl.UnknownFields
+-	sizeCache            protoimpl.SizeCache
++	OperatingSystem                    isNFSv4MountConfiguration_OperatingSystem `protobuf_oneof:"operating_system"`
++	EnforcedLeaseTime                  *durationpb.Duration                      `protobuf:"bytes,2,opt,name=enforced_lease_time,json=enforcedLeaseTime,proto3" json:"enforced_lease_time,omitempty"`
++	AnnouncedLeaseTime                 *durationpb.Duration                      `protobuf:"bytes,3,opt,name=announced_lease_time,json=announcedLeaseTime,proto3" json:"announced_lease_time,omitempty"`
++	SystemAuthentication               *RPCv2SystemAuthenticationConfiguration   `protobuf:"bytes,4,opt,name=system_authentication,json=systemAuthentication,proto3" json:"system_authentication,omitempty"`
++	MaximumReplyBodyPreallocationBytes *wrapperspb.UInt32Value                   `protobuf:"bytes,6,opt,name=maximum_reply_body_preallocation_bytes,json=maximumReplyBodyPreallocationBytes,proto3" json:"maximum_reply_body_preallocation_bytes,omitempty"`
++	unknownFields                      protoimpl.UnknownFields
++	sizeCache                          protoimpl.SizeCache
+ }
+ 
+ func (x *NFSv4MountConfiguration) Reset() {
+@@ -363,6 +364,13 @@ func (x *NFSv4MountConfiguration) GetSystemAuthentication() *RPCv2SystemAuthenti
+ 	return nil
+ }
+ 
++func (x *NFSv4MountConfiguration) GetMaximumReplyBodyPreallocationBytes() *wrapperspb.UInt32Value {
++	if x != nil {
++		return x.MaximumReplyBodyPreallocationBytes
++	}
++	return nil
++}
++
+ type isNFSv4MountConfiguration_OperatingSystem interface {
+ 	isNFSv4MountConfiguration_OperatingSystem()
+ }
+@@ -573,13 +581,14 @@ const file_github_com_buildbarn_bb_remote_execution_pkg_proto_configuration_file
+ 	"FUSERMOUNT\x10\x00\x12\n" +
+ 	"\n" +
+ 	"\x06DIRECT\x10\x01\x12\x19\n" +
+-	"\x15DIRECT_AND_FUSERMOUNT\x10\x02J\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\a\x10\b\"\x96\x04\n" +
++	"\x15DIRECT_AND_FUSERMOUNT\x10\x02J\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\a\x10\b\"\x88\x05\n" +
+ 	"\x17NFSv4MountConfiguration\x12c\n" +
+ 	"\x06darwin\x18\x01 \x01(\v2I.buildbarn.configuration.filesystem.virtual.NFSv4DarwinMountConfigurationH\x00R\x06darwin\x12`\n" +
+ 	"\x05linux\x18\x05 \x01(\v2H.buildbarn.configuration.filesystem.virtual.NFSv4LinuxMountConfigurationH\x00R\x05linux\x12I\n" +
+ 	"\x13enforced_lease_time\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x11enforcedLeaseTime\x12K\n" +
+ 	"\x14announced_lease_time\x18\x03 \x01(\v2\x19.google.protobuf.DurationR\x12announcedLeaseTime\x12\x87\x01\n" +
+-	"\x15system_authentication\x18\x04 \x01(\v2R.buildbarn.configuration.filesystem.virtual.RPCv2SystemAuthenticationConfigurationR\x14systemAuthenticationB\x12\n" +
++	"\x15system_authentication\x18\x04 \x01(\v2R.buildbarn.configuration.filesystem.virtual.RPCv2SystemAuthenticationConfigurationR\x14systemAuthentication\x12p\n" +
++	"&maximum_reply_body_preallocation_bytes\x18\x06 \x01(\v2\x1c.google.protobuf.UInt32ValueR\"maximumReplyBodyPreallocationBytesB\x12\n" +
+ 	"\x10operating_system\"\xbb\x01\n" +
+ 	"\x1dNFSv4DarwinMountConfiguration\x12\x1f\n" +
+ 	"\vsocket_path\x18\x01 \x01(\tR\n" +
+@@ -636,14 +645,15 @@ var file_github_com_buildbarn_bb_remote_execution_pkg_proto_configuration_filesy
+ 	9,  // 10: buildbarn.configuration.filesystem.virtual.NFSv4MountConfiguration.enforced_lease_time:type_name -> google.protobuf.Duration
+ 	9,  // 11: buildbarn.configuration.filesystem.virtual.NFSv4MountConfiguration.announced_lease_time:type_name -> google.protobuf.Duration
+ 	6,  // 12: buildbarn.configuration.filesystem.virtual.NFSv4MountConfiguration.system_authentication:type_name -> buildbarn.configuration.filesystem.virtual.RPCv2SystemAuthenticationConfiguration
+-	11, // 13: buildbarn.configuration.filesystem.virtual.NFSv4DarwinMountConfiguration.minor_version:type_name -> google.protobuf.UInt32Value
+-	10, // 14: buildbarn.configuration.filesystem.virtual.RPCv2SystemAuthenticationConfiguration.metadata_jmespath_expression:type_name -> buildbarn.configuration.jmespath.Expression
+-	12, // 15: buildbarn.configuration.filesystem.virtual.RPCv2SystemAuthenticationConfiguration.cache_replacement_policy:type_name -> buildbarn.configuration.eviction.CacheReplacementPolicy
+-	16, // [16:16] is the sub-list for method output_type
+-	16, // [16:16] is the sub-list for method input_type
+-	16, // [16:16] is the sub-list for extension type_name
+-	16, // [16:16] is the sub-list for extension extendee
+-	0,  // [0:16] is the sub-list for field type_name
++	11, // 13: buildbarn.configuration.filesystem.virtual.NFSv4MountConfiguration.maximum_reply_body_preallocation_bytes:type_name -> google.protobuf.UInt32Value
++	11, // 14: buildbarn.configuration.filesystem.virtual.NFSv4DarwinMountConfiguration.minor_version:type_name -> google.protobuf.UInt32Value
++	10, // 15: buildbarn.configuration.filesystem.virtual.RPCv2SystemAuthenticationConfiguration.metadata_jmespath_expression:type_name -> buildbarn.configuration.jmespath.Expression
++	12, // 16: buildbarn.configuration.filesystem.virtual.RPCv2SystemAuthenticationConfiguration.cache_replacement_policy:type_name -> buildbarn.configuration.eviction.CacheReplacementPolicy
++	17, // [17:17] is the sub-list for method output_type
++	17, // [17:17] is the sub-list for method input_type
++	17, // [17:17] is the sub-list for extension type_name
++	17, // [17:17] is the sub-list for extension extendee
++	0,  // [0:17] is the sub-list for field type_name
+ }
+ 
+ func init() {
+diff --git pkg/proto/configuration/filesystem/virtual/virtual.proto pkg/proto/configuration/filesystem/virtual/virtual.proto
+index 12f524e..3904a5d 100644
+--- pkg/proto/configuration/filesystem/virtual/virtual.proto
++++ pkg/proto/configuration/filesystem/virtual/virtual.proto
+@@ -230,6 +230,13 @@ message NFSv4MountConfiguration {
+   //
+   // NOTE: This option is only used by bb_virtual_tmp.
+   RPCv2SystemAuthenticationConfiguration system_authentication = 4;
++
++  // Maximum initial allocation for an RPC reply body, excluding headers.
++  // Larger replies grow the buffer as needed. Higher values avoid buffer
++  // growth for large replies, but allocate more memory for small replies.
++  //
++  // Defaults to 4096 bytes. Zero disables body preallocation.
++  google.protobuf.UInt32Value maximum_reply_body_preallocation_bytes = 6;
+ }
+ 
+ message NFSv4DarwinMountConfiguration {

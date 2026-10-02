@@ -25,6 +25,7 @@ git_override(
 git_override(
     module_name = "com_github_buildbarn_bb_remote_execution",
     commit = "236bcd95eb8fd2136807f8f6b47093639311a9f1",
+    patches = ["//:patches/com_github_buildbarn_bb_remote_execution/nfs-reply-preallocation.diff"],
     remote = "https://github.com/buildbarn/bb-remote-execution.git",
 )
 
@@ -37,6 +38,7 @@ git_override(
 git_override(
     module_name = "com_github_buildbarn_go_xdr",
     commit = "236788cf9e8948a1e8875c7dd243e2be180cdfd7",
+    patches = ["//:patches/com_github_buildbarn_go_xdr/bounded-reply-preallocation.diff"],
     remote = "https://github.com/buildbarn/go-xdr.git",
 )
 
@@ -76,6 +78,10 @@ use_repo(
 )
 
 go_deps_dev = use_extension("@gazelle//:extensions.bzl", "go_deps", dev_dependency = True)
+go_deps_dev.module_override(
+    patches = ["@com_github_buildbarn_go_xdr//:patches/com_github_golang_mock/mocks-for-funcs.diff"],
+    path = "github.com/golang/mock",
+)
 go_deps_dev.gazelle_override(
     build_file_generation = "on",
     path = "github.com/cncf/xds/go",
