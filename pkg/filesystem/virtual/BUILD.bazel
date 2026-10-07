@@ -49,6 +49,7 @@ go_library(
 go_test(
     name = "virtual_test",
     srcs = [
+        "bazel_output_service_directory_busy_test.go",
         "bazel_output_service_directory_test.go",
         "cas_directory_test.go",
         "decomposed_cas_directory_factory_test.go",
