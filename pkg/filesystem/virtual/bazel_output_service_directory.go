@@ -112,25 +112,25 @@ func NewBazelOutputServiceDirectory(handleAllocator virtual.StatefulHandleAlloca
 // acquireOutputBase serializes lifecycle calls, including calls for bases
 // that do not have an output path yet. Waiting does not hold the registry lock.
 func (d *BazelOutputServiceDirectory) acquireOutputBase(ctx context.Context, outputBaseID path.Component) (func(), error) {
-	d.lock.Lock()
-	defer d.lock.Unlock()
-
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, status.FromContextError(err).Err()
 		}
+
+		d.lock.Lock()
 		if busy, ok := d.busyBases[outputBaseID]; ok {
 			d.lock.Unlock()
 			select {
 			case <-busy:
 			case <-ctx.Done():
 			}
-			d.lock.Lock()
 			continue
 		}
 
 		busy := make(chan struct{})
 		d.busyBases[outputBaseID] = busy
+		d.lock.Unlock()
+
 		return func() {
 			d.lock.Lock()
 			delete(d.busyBases, outputBaseID)
