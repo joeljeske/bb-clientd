@@ -219,7 +219,7 @@ func TestBazelOutputServiceDirectoryBusyStartAndClean(t *testing.T) {
 				})
 				<-entered
 				if operation == "Restore" || operation == "UnrestoredClean" || operation == "UnrestoredCleanFailure" || operation == "CleanNotification" {
-					// Busy placeholders must not be exposed as partially initialized roots.
+					// Only initialized output roots are visible in the filesystem.
 					var attributes re_vfs.Attributes
 					_, s := d.VirtualLookup(ctx, path.MustNewComponent("a"), 0, &attributes)
 					require.Equal(t, re_vfs.StatusErrNoEnt, s)
