@@ -140,14 +140,16 @@ func (d *BazelOutputServiceDirectory) Clean(ctx context.Context, request *bazelo
 		return nil, status.Error(codes.InvalidArgument, "Output base ID is not a valid filename")
 	}
 
-RetryClean:
-	d.lock.Lock()
-	if busy := d.busy[outputBaseID]; busy != nil {
-		d.lock.Unlock()
-		if err := waitForOutputPath(ctx, busy); err != nil {
-			return nil, err
+	for {
+		d.lock.Lock()
+		if busy := d.busy[outputBaseID]; busy != nil {
+			d.lock.Unlock()
+			if err := waitForOutputPath(ctx, busy); err != nil {
+				return nil, err
+			}
+			continue
 		}
-		goto RetryClean
+		break
 	}
 	state, ok := d.outputBaseIDs[outputBaseID]
 	done := make(chan struct{})
@@ -328,14 +330,16 @@ func (d *BazelOutputServiceDirectory) StartBuild(ctx context.Context, request *b
 		return nil, err
 	}
 
-RetryStart:
-	d.lock.Lock()
-	if busy := d.busy[outputBaseID]; busy != nil {
-		d.lock.Unlock()
-		if err := waitForOutputPath(ctx, busy); err != nil {
-			return nil, err
+	for {
+		d.lock.Lock()
+		if busy := d.busy[outputBaseID]; busy != nil {
+			d.lock.Unlock()
+			if err := waitForOutputPath(ctx, busy); err != nil {
+				return nil, err
+			}
+			continue
 		}
-		goto RetryStart
+		break
 	}
 	state, ok := d.outputBaseIDs[outputBaseID]
 	if other, exists := d.buildIDs[request.BuildId]; exists && other != state {
@@ -419,26 +423,27 @@ RetryStart:
 // only be invoked as part of a build (e.g., StageArtifacts(),
 // BatchStat()).
 func (d *BazelOutputServiceDirectory) getOutputPathAndBuildState(ctx context.Context, buildID string) (*outputPathState, *buildState, error) {
-RetryLookup:
-	d.lock.Lock()
+	for {
+		d.lock.Lock()
 
-	outputPathState, ok := d.buildIDs[buildID]
-	if !ok {
-		d.lock.Unlock()
-		return nil, nil, status.Error(codes.FailedPrecondition, "Build ID is not associated with any running build")
-	}
-	if busy := d.busy[outputPathState.outputBaseID]; busy != nil {
-		d.lock.Unlock()
-		if err := waitForOutputPath(ctx, busy); err != nil {
-			return nil, nil, err
+		outputPathState, ok := d.buildIDs[buildID]
+		if !ok {
+			d.lock.Unlock()
+			return nil, nil, status.Error(codes.FailedPrecondition, "Build ID is not associated with any running build")
 		}
-		goto RetryLookup
+		if busy := d.busy[outputPathState.outputBaseID]; busy != nil {
+			d.lock.Unlock()
+			if err := waitForOutputPath(ctx, busy); err != nil {
+				return nil, nil, err
+			}
+			continue
+		}
+		// Bazel may issue staging/stat requests concurrently with each other,
+		// but is expected to finish them before issuing a lifecycle RPC.
+		buildState := outputPathState.buildState
+		d.lock.Unlock()
+		return outputPathState, buildState, nil
 	}
-	// Bazel may issue staging/stat requests concurrently with each other,
-	// but is expected to finish them before issuing a lifecycle RPC.
-	buildState := outputPathState.buildState
-	d.lock.Unlock()
-	return outputPathState, buildState, nil
 }
 
 // parentDirectoryCreatingComponentWalker is an implementation of
@@ -725,20 +730,23 @@ func (d *BazelOutputServiceDirectory) FinalizeArtifacts(ctx context.Context, req
 // build has completed. This prevents successive StageArtifacts() and
 // BatchStat() calls from being processed.
 func (d *BazelOutputServiceDirectory) FinalizeBuild(ctx context.Context, request *bazeloutputservice.FinalizeBuildRequest) (*bazeloutputservice.FinalizeBuildResponse, error) {
-RetryFinalize:
-	d.lock.Lock()
-	state, ok := d.buildIDs[request.BuildId]
-	if !ok {
-		// Silently ignore unknown IDs to keep finalization idempotent.
-		d.lock.Unlock()
-		return &bazeloutputservice.FinalizeBuildResponse{}, nil
-	}
-	if busy := d.busy[state.outputBaseID]; busy != nil {
-		d.lock.Unlock()
-		if err := waitForOutputPath(ctx, busy); err != nil {
-			return nil, err
+	var state *outputPathState
+	for {
+		d.lock.Lock()
+		state = d.buildIDs[request.BuildId]
+		if state == nil {
+			// Silently ignore unknown IDs to keep finalization idempotent.
+			d.lock.Unlock()
+			return &bazeloutputservice.FinalizeBuildResponse{}, nil
 		}
-		goto RetryFinalize
+		if busy := d.busy[state.outputBaseID]; busy != nil {
+			d.lock.Unlock()
+			if err := waitForOutputPath(ctx, busy); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		break
 	}
 	done := make(chan struct{})
 	d.busy[state.outputBaseID] = done
