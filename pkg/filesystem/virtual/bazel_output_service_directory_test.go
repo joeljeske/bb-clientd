@@ -1402,6 +1402,15 @@ func TestBazelOutputServiceDirectoryLifecycleContention(t *testing.T) {
 				go func() { done <- operation() }()
 				<-entered
 
+				// New stage/stat calls fail immediately while a lifecycle call
+				// owns the base, even though its build ID is still registered.
+				if phase != "Restore" && phase != "UnopenedClean" {
+					_, err = d.StageArtifacts(ctx, &bazeloutputservice.StageArtifactsRequest{BuildId: "build"})
+					testutil.RequireEqualStatus(t, status.Error(codes.FailedPrecondition, "Output base is busy"), err)
+					_, err = d.BatchStat(ctx, &bazeloutputservice.BatchStatRequest{BuildId: "build"})
+					testutil.RequireEqualStatus(t, status.Error(codes.FailedPrecondition, "Output base is busy"), err)
+				}
+
 				// Every RPC on another base can finish while this one is busy.
 				otherPath := mock.NewMockOutputPath(ctrl)
 				outputPathFactory.EXPECT().StartInitialBuild(path.MustNewComponent("other"), gomock.Any(), digestFunction, gomock.Any()).Return(otherPath)
@@ -1454,6 +1463,7 @@ func TestBazelOutputServiceDirectoryLifecycleContention(t *testing.T) {
 
 				// A finalizer already waiting on a removed/completed build must
 				// not finalize the next build, even if that build wins the race.
+				// A duplicate FinalizeBuild() must wait, not treat busy as unknown.
 				var finalized chan error
 				if phase == "Finalize" || phase == "Clean" {
 					finalized = make(chan error, 1)
@@ -1470,7 +1480,7 @@ func TestBazelOutputServiceDirectoryLifecycleContention(t *testing.T) {
 				go func() { started <- startBuild(ctx, "base", "next-build") }()
 				synctest.Wait()
 				require.Len(t, started, 0)
-				require.Len(t, finalized, 0)
+				require.Len(t, finalized, 0, "FinalizeBuild must wait for the busy base")
 
 				close(resume)
 				require.NoError(t, <-done)
@@ -1480,6 +1490,8 @@ func TestBazelOutputServiceDirectoryLifecycleContention(t *testing.T) {
 				}
 				_, err = d.BatchStat(ctx, &bazeloutputservice.BatchStatRequest{BuildId: "build"})
 				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				_, err = d.StageArtifacts(ctx, &bazeloutputservice.StageArtifactsRequest{BuildId: "next-build"})
+				require.NoError(t, err)
 				_, err = d.BatchStat(ctx, &bazeloutputservice.BatchStatRequest{BuildId: "next-build"})
 				require.NoError(t, err)
 				_, err = d.FinalizeBuild(ctx, &bazeloutputservice.FinalizeBuildRequest{BuildId: "build"})

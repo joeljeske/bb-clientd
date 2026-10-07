@@ -389,8 +389,8 @@ func (d *BazelOutputServiceDirectory) StartBuild(ctx context.Context, request *b
 			d.changeID++
 		}
 
-		// Allow StageArtifacts() and BatchStat() requests for
-		// the new build ID.
+		// Register the new build ID. StageArtifacts() and BatchStat()
+		// requests are admitted once this lifecycle call releases the base.
 		state.buildState = &buildState{
 			id:                 request.BuildId,
 			digestFunction:     digestFunction,
@@ -420,9 +420,8 @@ func (d *BazelOutputServiceDirectory) StartBuild(ctx context.Context, request *b
 }
 
 // getOutputPathAndBuildState returns the state objects associated with
-// a given build ID. This function is used by all gRPC methods that can
-// only be invoked as part of a build (e.g., StageArtifacts(),
-// BatchStat()).
+// a given build ID, rejecting StageArtifacts() and BatchStat() requests
+// while a lifecycle call owns the output base.
 func (d *BazelOutputServiceDirectory) getOutputPathAndBuildState(buildID string) (*outputPathState, *buildState, error) {
 	d.lock.Lock()
 	defer d.lock.Unlock()
@@ -430,6 +429,9 @@ func (d *BazelOutputServiceDirectory) getOutputPathAndBuildState(buildID string)
 	outputPathState, ok := d.buildIDs[buildID]
 	if !ok {
 		return nil, nil, status.Error(codes.FailedPrecondition, "Build ID is not associated with any running build")
+	}
+	if _, ok := d.busyBases[outputPathState.outputBaseID]; ok {
+		return nil, nil, status.Error(codes.FailedPrecondition, "Output base is busy")
 	}
 	return outputPathState, outputPathState.buildState, nil
 }
@@ -720,11 +722,16 @@ func (d *BazelOutputServiceDirectory) FinalizeArtifacts(ctx context.Context, req
 func (d *BazelOutputServiceDirectory) FinalizeBuild(ctx context.Context, request *bazeloutputservice.FinalizeBuildRequest) (*bazeloutputservice.FinalizeBuildResponse, error) {
 	// Silently ignore requests for unknown build IDs. This ensures
 	// that FinalizeBuild() remains idempotent.
-	outputPathState, buildState, err := d.getOutputPathAndBuildState(request.BuildId)
-	if err != nil {
+	d.lock.Lock()
+	outputPathState, ok := d.buildIDs[request.BuildId]
+	if !ok {
+		d.lock.Unlock()
 		return &bazeloutputservice.FinalizeBuildResponse{}, nil
 	}
+	buildState := outputPathState.buildState
+	d.lock.Unlock()
 
+	// Unlike stage/stat admission, lifecycle calls wait for a busy base.
 	release, err := d.acquireOutputBase(ctx, outputPathState.outputBaseID)
 	if err != nil {
 		return nil, err
