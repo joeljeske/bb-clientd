@@ -125,21 +125,10 @@ func waitForOutputPath(ctx context.Context, busy <-chan struct{}) error {
 	}
 }
 
-// finishOutputPathOperation releases a lifecycle operation's busy state.
-func (d *BazelOutputServiceDirectory) finishOutputPathOperation(outputBaseID path.Component, done chan struct{}) {
-	d.lock.Lock()
-	delete(d.busy, outputBaseID)
-	close(done)
-	d.lock.Unlock()
-}
-
-// Clean all build outputs associated with a single output base.
-func (d *BazelOutputServiceDirectory) Clean(ctx context.Context, request *bazeloutputservice.CleanRequest) (*bazeloutputservice.CleanResponse, error) {
-	outputBaseID, ok := path.NewComponent(request.OutputBaseId)
-	if !ok {
-		return nil, status.Error(codes.InvalidArgument, "Output base ID is not a valid filename")
-	}
-
+// acquireOutputBase serializes lifecycle operations for one output base.
+// Neither acquisition nor release returns with d.lock held. The caller must
+// invoke the returned release function exactly once.
+func (d *BazelOutputServiceDirectory) acquireOutputBase(ctx context.Context, outputBaseID path.Component) (func(), error) {
 	for {
 		d.lock.Lock()
 		if busy := d.busy[outputBaseID]; busy != nil {
@@ -149,12 +138,33 @@ func (d *BazelOutputServiceDirectory) Clean(ctx context.Context, request *bazelo
 			}
 			continue
 		}
-		break
+		done := make(chan struct{})
+		d.busy[outputBaseID] = done
+		d.lock.Unlock()
+		return func() {
+			d.lock.Lock()
+			delete(d.busy, outputBaseID)
+			close(done)
+			d.lock.Unlock()
+		}, nil
 	}
+}
+
+// Clean all build outputs associated with a single output base.
+func (d *BazelOutputServiceDirectory) Clean(ctx context.Context, request *bazeloutputservice.CleanRequest) (*bazeloutputservice.CleanResponse, error) {
+	outputBaseID, ok := path.NewComponent(request.OutputBaseId)
+	if !ok {
+		return nil, status.Error(codes.InvalidArgument, "Output base ID is not a valid filename")
+	}
+
+	release, err := d.acquireOutputBase(ctx, outputBaseID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	d.lock.Lock()
 	state, ok := d.outputBaseIDs[outputBaseID]
-	done := make(chan struct{})
-	d.busy[outputBaseID] = done
-	defer d.finishOutputPathOperation(outputBaseID, done)
 	d.lock.Unlock()
 	if ok {
 		// Remove all data stored inside the output path. This
@@ -330,25 +340,18 @@ func (d *BazelOutputServiceDirectory) StartBuild(ctx context.Context, request *b
 		return nil, err
 	}
 
-	for {
-		d.lock.Lock()
-		if busy := d.busy[outputBaseID]; busy != nil {
-			d.lock.Unlock()
-			if err := waitForOutputPath(ctx, busy); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		break
+	release, err := d.acquireOutputBase(ctx, outputBaseID)
+	if err != nil {
+		return nil, err
 	}
+	defer release()
+
+	d.lock.Lock()
 	state, ok := d.outputBaseIDs[outputBaseID]
 	if other, exists := d.buildIDs[request.BuildId]; exists && other != state {
 		d.lock.Unlock()
 		return nil, status.Error(codes.InvalidArgument, "Build ID is associated with another output base")
 	}
-	done := make(chan struct{})
-	d.busy[outputBaseID] = done
-	defer d.finishOutputPathOperation(outputBaseID, done)
 
 	if !ok {
 		d.lock.Unlock()
@@ -739,18 +742,22 @@ func (d *BazelOutputServiceDirectory) FinalizeBuild(ctx context.Context, request
 			d.lock.Unlock()
 			return &bazeloutputservice.FinalizeBuildResponse{}, nil
 		}
-		if busy := d.busy[state.outputBaseID]; busy != nil {
-			d.lock.Unlock()
-			if err := waitForOutputPath(ctx, busy); err != nil {
-				return nil, err
-			}
-			continue
+		d.lock.Unlock()
+
+		release, err := d.acquireOutputBase(ctx, state.outputBaseID)
+		if err != nil {
+			return nil, err
 		}
-		break
+		d.lock.Lock()
+		if d.buildIDs[request.BuildId] == state {
+			defer release()
+			break
+		}
+		// The build was removed or moved to another output path while waiting.
+		// Release this base and look up the registration again.
+		d.lock.Unlock()
+		release()
 	}
-	done := make(chan struct{})
-	d.busy[state.outputBaseID] = done
-	defer d.finishOutputPathOperation(state.outputBaseID, done)
 	buildState := state.buildState
 	d.lock.Unlock()
 
