@@ -118,6 +118,10 @@ func (d *BazelOutputServiceDirectory) acquireOutputBase(ctx context.Context, out
 		}
 
 		d.lock.Lock()
+		if err := ctx.Err(); err != nil {
+			d.lock.Unlock()
+			return nil, status.FromContextError(err).Err()
+		}
 		if busy, ok := d.busyBases[outputBaseID]; ok {
 			d.lock.Unlock()
 			select {
